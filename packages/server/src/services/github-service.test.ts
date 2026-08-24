@@ -241,6 +241,62 @@ function currentPullRequestGithubFactsJson(overrides: Record<string, unknown> = 
   });
 }
 
+function batchPollPrNodeJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 42,
+    url: "https://github.com/acme/widgets/pull/42",
+    title: "Widget PR",
+    state: "MERGED",
+    isDraft: false,
+    baseRefName: "main",
+    headRefName: "feat-a",
+    headRefOid: "oid-42",
+    mergedAt: "2026-08-01T00:00:00Z",
+    mergeable: "UNKNOWN",
+    reviewDecision: null,
+    headRepositoryOwner: { login: "acme" },
+    mergeStateStatus: "CLEAN",
+    autoMergeRequest: null,
+    viewerCanEnableAutoMerge: false,
+    viewerCanDisableAutoMerge: false,
+    viewerCanMergeAsAdmin: false,
+    viewerCanUpdateBranch: false,
+    isMergeQueueEnabled: false,
+    isInMergeQueue: false,
+    ...overrides,
+  };
+}
+
+function batchPollRepositoryJson(
+  nodes: Array<Record<string, unknown>>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    isFork: false,
+    autoMergeAllowed: true,
+    mergeCommitAllowed: true,
+    squashMergeAllowed: true,
+    rebaseMergeAllowed: true,
+    viewerDefaultMergeMethod: "SQUASH",
+    pullRequests: { nodes },
+    ...overrides,
+  };
+}
+
+function batchPollChecksAliasJson(
+  contexts: Array<Record<string, unknown>>,
+): Record<string, unknown> {
+  return {
+    pullRequest: {
+      commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: contexts } } } }] },
+    },
+  };
+}
+
+function batchPollStatusJson(aliases: Record<string, unknown>): string {
+  return JSON.stringify({ data: aliases });
+}
+
 function createCurrentPullRequestStatus(
   overrides: Partial<CurrentPullRequestStatus> = {},
 ): CurrentPullRequestStatus {
@@ -974,6 +1030,449 @@ describe("ForgeService", () => {
     await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_FAST_POLL_MS);
 
     expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
+  });
+
+  it("batches PR status polls across workspaces into one GraphQL request", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([
+      batchPollStatusJson({
+        t0: batchPollRepositoryJson([
+          batchPollPrNodeJson({
+            number: 41,
+            url: "https://github.com/acme/widgets/pull/41",
+            headRefName: "feat-a",
+            headRefOid: "oid-a",
+          }),
+        ]),
+        t1: batchPollRepositoryJson([
+          batchPollPrNodeJson({
+            number: 52,
+            url: "https://github.com/acme/gadgets/pull/52",
+            headRefName: "feat-b",
+            headRefOid: "oid-b",
+          }),
+        ]),
+      }),
+      batchPollStatusJson({
+        t0: batchPollChecksAliasJson([
+          { __typename: "StatusContext", context: "ci", state: "SUCCESS" },
+        ]),
+        t1: batchPollChecksAliasJson([
+          { __typename: "StatusContext", context: "ci", state: "SUCCESS" },
+        ]),
+      }),
+      batchPollStatusJson({
+        t0: batchPollRepositoryJson([
+          batchPollPrNodeJson({
+            number: 41,
+            url: "https://github.com/acme/widgets/pull/41",
+            headRefName: "feat-a",
+            headRefOid: "oid-a",
+          }),
+        ]),
+        t1: batchPollRepositoryJson([
+          batchPollPrNodeJson({
+            number: 52,
+            url: "https://github.com/acme/gadgets/pull/52",
+            headRefName: "feat-b",
+            headRefOid: "oid-b",
+          }),
+        ]),
+      }),
+    ]);
+    const slugs: Record<string, string> = { "/ws-a": "acme/widgets", "/ws-b": "acme/gadgets" };
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async (cwd) => slugs[cwd] ?? null,
+      now: () => now,
+    });
+    const statusesA: Array<CurrentPullRequestStatus | null> = [];
+    const statusesB: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscriptionA = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      headSha: "oid-a",
+      onStatus: (status) => statusesA.push(status),
+    });
+    const subscriptionB = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-b",
+      headRef: "feat-b",
+      headSha: "oid-b",
+      onStatus: (status) => statusesB.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(0);
+    expect(runner.calls).toHaveLength(2);
+    expect(runner.calls[0]?.args.slice(0, 2)).toEqual(["api", "graphql"]);
+    expect(runner.calls[0]?.args[3]).toContain('t0: repository(owner: "acme", name: "widgets")');
+    expect(runner.calls[0]?.args[3]).toContain('t1: repository(owner: "acme", name: "gadgets")');
+    expect(runner.calls[0]?.args[3]).toContain('headRefName: "feat-a"');
+    expect(runner.calls[0]?.args[3]).toContain('headRefName: "feat-b"');
+    expect(runner.calls[1]?.args[3]).toContain("pullRequest(number: 41)");
+    expect(runner.calls[1]?.args[3]).toContain("pullRequest(number: 52)");
+    expect(statusesA).toEqual([
+      expect.objectContaining({
+        number: 41,
+        state: "merged",
+        isMerged: true,
+        checksStatus: "success",
+        forgeSpecific: expect.objectContaining({ forge: "github", mergeStateStatus: "CLEAN" }),
+      }),
+    ]);
+    expect(statusesB).toEqual([
+      expect.objectContaining({ number: 52, state: "merged", checksStatus: "success" }),
+    ]);
+
+    // Merged PR checks are frozen: the second cycle reuses the cached rollup
+    // and issues only the discovery request.
+    now = EXPECTED_GITHUB_SLOW_POLL_MS;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_SLOW_POLL_MS);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(3);
+    expect(statusesA).toHaveLength(2);
+    expect(statusesA[1]).toEqual(expect.objectContaining({ number: 41, checksStatus: "success" }));
+
+    subscriptionA?.unsubscribe();
+    subscriptionB?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("refetches checks for open PRs on every batched poll at fast cadence", async () => {
+    let now = 0;
+    const openNode = batchPollPrNodeJson({
+      number: 7,
+      url: "https://github.com/acme/widgets/pull/7",
+      state: "OPEN",
+      mergedAt: null,
+      headRefName: "feat-a",
+      headRefOid: "oid-open",
+    });
+    const pendingChecks = batchPollChecksAliasJson([
+      { __typename: "StatusContext", context: "ci", state: "PENDING" },
+    ]);
+    const runner = createScriptedRunner([
+      batchPollStatusJson({ t0: batchPollRepositoryJson([openNode]) }),
+      batchPollStatusJson({ t0: pendingChecks }),
+      batchPollStatusJson({ t0: batchPollRepositoryJson([openNode]) }),
+      batchPollStatusJson({ t0: pendingChecks }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(2);
+    expect(statuses).toEqual([
+      expect.objectContaining({ number: 7, state: "open", checksStatus: "pending" }),
+    ]);
+
+    now = EXPECTED_GITHUB_FAST_POLL_MS;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_FAST_POLL_MS);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(4);
+    expect(statuses).toHaveLength(2);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("backs off all batched targets on a failed batch without per-target fallback calls", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([{ error: new Error("network down") }]);
+    const slugs: Record<string, string> = { "/ws-a": "acme/widgets", "/ws-b": "acme/gadgets" };
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async (cwd) => slugs[cwd] ?? null,
+      now: () => now,
+    });
+    const errors: unknown[] = [];
+
+    const subscriptionA = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onError: (error) => errors.push(error),
+    });
+    const subscriptionB = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-b",
+      headRef: "feat-b",
+      onError: (error) => errors.push(error),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(1);
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(0);
+    expect(errors).toHaveLength(2);
+
+    subscriptionA?.unsubscribe();
+    subscriptionB?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("falls back to the per-target lookup when a fork repository has no matching PR", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([
+      batchPollStatusJson({ t0: batchPollRepositoryJson([], { isFork: true }) }),
+      currentPullRequestJson({ headRefName: "feat-a" }),
+      currentPullRequestGithubFactsJson(),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "forkowner/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls[0]?.args.slice(0, 2)).toEqual(["api", "graphql"]);
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
+    expect(statuses).toEqual([expect.objectContaining({ number: 42, state: "open" })]);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("keeps refetching checks for a closed PR while its checks are still pending", async () => {
+    let now = 0;
+    const closedNode = batchPollPrNodeJson({
+      number: 9,
+      url: "https://github.com/acme/widgets/pull/9",
+      state: "CLOSED",
+      mergedAt: null,
+      headRefName: "feat-a",
+      headRefOid: "oid-closed",
+    });
+    const runner = createScriptedRunner([
+      batchPollStatusJson({ t0: batchPollRepositoryJson([closedNode]) }),
+      batchPollStatusJson({
+        t0: batchPollChecksAliasJson([
+          { __typename: "StatusContext", context: "ci", state: "PENDING" },
+        ]),
+      }),
+      batchPollStatusJson({ t0: batchPollRepositoryJson([closedNode]) }),
+      batchPollStatusJson({
+        t0: batchPollChecksAliasJson([
+          { __typename: "StatusContext", context: "ci", state: "SUCCESS" },
+        ]),
+      }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      headSha: "oid-closed",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(2);
+    expect(statuses).toEqual([expect.objectContaining({ number: 9, checksStatus: "pending" })]);
+
+    // Pending checks are never frozen, so the next cycle re-runs the checks
+    // query and observes the completed run.
+    now = EXPECTED_GITHUB_FAST_POLL_MS;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_FAST_POLL_MS);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(4);
+    expect(statuses[1]).toEqual(expect.objectContaining({ number: 9, checksStatus: "success" }));
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("falls back to the per-target lookup when the batch candidate page is full", async () => {
+    let now = 0;
+    const crowdedNodes = Array.from({ length: 10 }, (_, index) =>
+      batchPollPrNodeJson({
+        number: 100 + index,
+        url: `https://github.com/acme/widgets/pull/${100 + index}`,
+        state: "OPEN",
+        mergedAt: null,
+        headRefName: "feat-a",
+        headRepositoryOwner: { login: "stranger" },
+      }),
+    );
+    const runner = createScriptedRunner([
+      batchPollStatusJson({ t0: batchPollRepositoryJson(crowdedNodes) }),
+      currentPullRequestJson({ headRefName: "feat-a" }),
+      currentPullRequestGithubFactsJson(),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    // Ten same-named fork PRs filled the page, so absence of a self-owned PR
+    // is inconclusive and the target resolves through the legacy path.
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
+    expect(statuses).toEqual([expect.objectContaining({ number: 42, state: "open" })]);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("ignores another fork owner's same-named branch in batched polls without an owner hint", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([
+      batchPollStatusJson({
+        t0: batchPollRepositoryJson([
+          batchPollPrNodeJson({
+            number: 900,
+            url: "https://github.com/acme/widgets/pull/900",
+            state: "OPEN",
+            mergedAt: null,
+            headRefName: "main",
+            headRepositoryOwner: { login: "stranger" },
+          }),
+        ]),
+      }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "main",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(1);
+    expect(statuses).toEqual([null]);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("recovers healthy aliases from a partially failed batch response", async () => {
+    let now = 0;
+    const partialBody = batchPollStatusJson({
+      t0: batchPollRepositoryJson([
+        batchPollPrNodeJson({
+          number: 41,
+          url: "https://github.com/acme/widgets/pull/41",
+          headRefName: "feat-a",
+          headRefOid: "oid-a",
+        }),
+      ]),
+      t1: null,
+    });
+    const runner = createScriptedRunner([
+      {
+        error: Object.assign(new Error("gh exited 1"), {
+          code: 1,
+          stdout: partialBody,
+          stderr: "GraphQL: Could not resolve to a Repository",
+        }),
+      },
+      batchPollStatusJson({
+        t0: batchPollChecksAliasJson([
+          { __typename: "StatusContext", context: "ci", state: "SUCCESS" },
+        ]),
+      }),
+    ]);
+    const slugs: Record<string, string> = { "/ws-a": "acme/widgets", "/ws-b": "acme/missing" };
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async (cwd) => slugs[cwd] ?? null,
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+    const errors: unknown[] = [];
+
+    const subscriptionA = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      headSha: "oid-a",
+      onStatus: (status) => statuses.push(status),
+    });
+    const subscriptionB = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-b",
+      headRef: "feat-b",
+      onError: (error) => errors.push(error),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(2);
+    expect(statuses).toEqual([
+      expect.objectContaining({ number: 41, state: "merged", checksStatus: "success" }),
+    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(GitHubCommandError);
+
+    subscriptionA?.unsubscribe();
+    subscriptionB?.unsubscribe();
+    service.dispose?.();
   });
 
   it("fetches PR reviews and issue comments with one GraphQL call sorted chronologically", async () => {
