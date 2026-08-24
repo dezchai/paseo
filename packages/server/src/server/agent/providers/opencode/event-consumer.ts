@@ -4,10 +4,7 @@ import {
   type OpencodeClient,
 } from "@opencode-ai/sdk/v2/client";
 
-export type OpenCodeEventSourceInput =
-  | GlobalEvent
-  | { type: "reconnected" }
-  | { type: "server-exited"; error: Error };
+export type OpenCodeEventSourceInput = GlobalEvent | { type: "server-exited"; error: Error };
 
 export interface OpenCodeEventSource {
   ready(): Promise<void>;
@@ -128,11 +125,11 @@ export class OpenCodeEventConsumer implements OpenCodeEventSource {
       for await (const event of result.stream) {
         if (this.closed) return delivered;
         armWatchdog();
-        if (!delivered) {
-          delivered = true;
-          if (this.connected) this.publish({ type: "reconnected" });
+        delivered = true;
+        if (!this.connected && event.payload.type === "server.connected") {
           this.connected = true;
           this.resolveReady();
+          continue;
         }
         this.publish(event);
       }

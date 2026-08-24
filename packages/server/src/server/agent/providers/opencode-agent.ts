@@ -3655,13 +3655,13 @@ class OpenCodeAgentSession implements AgentSession {
     const effectiveMode = resolveOpenCodeRuntimeAgentId(this.currentMode);
 
     try {
-      // The stream cannot deliver its first record before OpenCode finished booting, so
+      // OpenCode emits server.connected after it finishes booting, so
       // this wait gets the same budget as server startup instead of a shorter one that
       // fails turns on slow (plugin-heavy or cold) starts.
       await withTimeout(
         this.events.ready(),
         OPENCODE_SERVER_STARTUP_TIMEOUT_MS,
-        "OpenCode event stream first record",
+        "OpenCode server.connected event",
       );
     } catch (error) {
       if (this.abortController === turnAbortController) {
@@ -4141,11 +4141,7 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   private async consumeEventSourceInput(input: OpenCodeEventSourceInput): Promise<void> {
-    if ("type" in input && input.type === "reconnected") {
-      await this.reconcileAfterGap(++this.gapRepairRevision);
-      return;
-    }
-    if ("type" in input && input.type === "server-exited") {
+    if (!("payload" in input)) {
       if (this.turnState.status === "stopping") return this.finishStoppingTurn(this.turnState.stop);
       const turnId = this.activeForegroundTurnId;
       if (turnId) {
@@ -4154,6 +4150,10 @@ class OpenCodeAgentSession implements AgentSession {
           turnId,
         );
       }
+      return;
+    }
+    if (input.payload.type === "server.connected") {
+      await this.reconcileAfterGap(++this.gapRepairRevision);
       return;
     }
     await this.consumeOpenCodeStreamEvent({ rawEvent: input, eventCount: 0 });
