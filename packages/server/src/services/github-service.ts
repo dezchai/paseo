@@ -114,7 +114,7 @@ export const GITHUB_POLL_ERROR_BACKOFF_CAP_MS = 300_000;
 // machine-wide (issues #3587 / #2470).
 export const GITHUB_POLL_BATCH_MAX = 25;
 export const GITHUB_POLL_ALIGNMENT_MS = 5_000;
-const GITHUB_GRAPHQL_RESERVE_RATIO = 0.4;
+const GITHUB_GRAPHQL_RESERVE_RATIO = 0.8;
 const GITHUB_GRAPHQL_RESET_GRACE_MS = 1_000;
 const BATCH_PR_CANDIDATE_LIMIT = 10;
 const FROZEN_PR_CHECKS_CACHE_MAX_ENTRIES = 512;
@@ -1471,13 +1471,33 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     const legacyTargets: GitHubPollTarget[] = [];
     const batchGroups = new Map<string, GitHubBatchPollEntry[]>();
     for (const target of due) {
+      if (target.retainCount <= 0) {
+        continue;
+      }
       const host = peekRepoHost(target.cwd);
       const slug = peekRepoSlug(target.cwd);
+      if (!host.settled || !slug.settled) {
+        // Repository identity comes from asynchronous git reads. Retry this
+        // target when its own reads settle instead of sending it through the
+        // legacy path or making one slow workspace hold the entire batch.
+        target.pollCycleStartedAt = null;
+        void Promise.all([
+          resolveRepoHostCached(target.cwd).catch(() => null),
+          resolveRepoSlugCached(target.cwd),
+        ]).then(() => {
+          if (target.retainCount > 0 && target.nextDueAt === null) {
+            // Identity reads settle independently. Put ready targets on the
+            // next shared grid boundary so they form a real startup batch.
+            scheduleGitHubPollAfter(target, 1);
+          }
+          return undefined;
+        });
+        continue;
+      }
       const [owner, name, extra] = slug.value?.split("/") ?? [];
-      // A cwd whose host or slug is still resolving (or has no origin slug at
-      // all) polls through the legacy per-target path this cycle; batch
-      // grouping needs both facts synchronously.
-      if (!host.settled || !slug.settled || !owner || !name || extra !== undefined) {
+      // A cwd with no origin slug polls through the legacy per-target path;
+      // batch grouping needs a complete owner/name identity.
+      if (!owner || !name || extra !== undefined) {
         legacyTargets.push(target);
         continue;
       }
@@ -1608,11 +1628,9 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       return;
     }
     const rateLimit = parseGraphqlBatchRateLimit(response.stdout);
-    if (rateLimit && pauseGitHubPollsAtReserve(firstEntry.host, rateLimit)) {
-      const error = new GitHubGraphqlPollPausedError(rateLimit);
-      reportGitHubBatchError(addressedEntries, error);
-      return;
-    }
+    const pausedAtReserve = rateLimit
+      ? pauseGitHubPollsAtReserve(firstEntry.host, rateLimit)
+      : false;
 
     const distribution = distributeGitHubPollBatch({
       entries: addressedEntries,
@@ -1620,6 +1638,32 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       args,
       startedAt,
     });
+    if (pausedAtReserve) {
+      // The discovery response is already paid for and contains enough data to
+      // show the PR identity and merge state. Publish it without checks, then
+      // leave follow-up requests paused until reset. Discarding this response
+      // makes every PR disappear when a daemon starts below the reserve.
+      for (const item of distribution.pendingChecks) {
+        finalizeBatchPollTarget({
+          entry: item.entry,
+          node: item.node,
+          repository: item.repository,
+          rollup: null,
+          startedAt,
+        });
+      }
+      const unresolvedEntries = [
+        ...distribution.legacyFallback.map((target) => ({ target })),
+        ...distribution.redirected,
+      ];
+      if (unresolvedEntries.length > 0 && rateLimit) {
+        const error = new GitHubGraphqlPollPausedError(rateLimit);
+        for (const entry of unresolvedEntries) {
+          updatePollTargetAfterError(entry.target, error);
+        }
+      }
+      return;
+    }
     if (distribution.pendingChecks.length > 0) {
       await loadBatchPullRequestChecks(distribution.pendingChecks, startedAt);
     }

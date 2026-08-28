@@ -179,6 +179,14 @@ interface SessionTestAccess {
     getCheckout: (cwd: string) => Promise<unknown>;
     getSnapshot: (cwd: string, options?: unknown) => Promise<WorkspaceGitRuntimeSnapshot>;
     peekSnapshot: (cwd: string) => WorkspaceGitRuntimeSnapshot | null;
+    peekCachedSidebarStatus?: (cwd: string) => {
+      cwd: string;
+      currentBranch: string;
+      remoteUrl: string;
+      forge: string;
+      pullRequest: WorkspaceGitRuntimeSnapshot["forge"]["pullRequest"];
+      updatedAtMs: number;
+    } | null;
     registerWorkspace: (params: { cwd: string }, listener: unknown) => { unsubscribe: () => void };
   };
   filesystem: {
@@ -6944,6 +6952,76 @@ test("fetch_workspaces_response reads runtime fields from passive workspace git 
       },
     }),
   ]);
+});
+
+test("fetch_workspaces_response restores cached PR status before a cold git snapshot exists", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaceGitService = createNoopWorkspaceGitService();
+  workspaceGitService.peekCachedSidebarStatus = vi.fn(() => ({
+    cwd: REPO_CWD,
+    currentBranch: "feature/cached-status",
+    remoteUrl: "https://github.com/acme/repo.git",
+    forge: "github",
+    pullRequest: {
+      number: 456,
+      url: "https://github.com/acme/repo/pull/456",
+      title: "Restore cached PR status",
+      state: "open",
+      baseRefName: "main",
+      headRefName: "feature/cached-status",
+      isMerged: false,
+      checksStatus: "success",
+    },
+    updatedAtMs: Date.now(),
+  }));
+  workspaceGitService.registerWorkspace = vi.fn(() => ({ unsubscribe: () => {} }));
+  const session = asTestSession(createSessionForWorkspaceTests({ workspaceGitService }));
+  const project = createPersistedProjectRecord({
+    projectId: "proj-cached-runtime-fetch",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-cached-runtime-fetch",
+    projectId: project.projectId,
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "feature/cached-status",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  session.emit = (message) => {
+    if (isSessionOutboundMessage(message)) emitted.push(message);
+  };
+  session.listAgentPayloads = async () => [];
+  session.projectRegistry.list = async () => [project];
+  session.workspaceRegistry.list = async () => [workspace];
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-fetch-workspaces-cached-runtime",
+  });
+
+  const response = emitted.find((message) => message.type === "fetch_workspaces_response");
+  expect(workspaceGitService.peekCachedSidebarStatus).toHaveBeenCalledWith(REPO_CWD);
+  expect(response?.payload.entries).toEqual([
+    expect.objectContaining({
+      id: "ws-cached-runtime-fetch",
+      forge: "github",
+      githubRuntime: {
+        featuresEnabled: true,
+        pullRequest: expect.objectContaining({
+          number: 456,
+          checksStatus: "success",
+        }),
+        error: null,
+      },
+    }),
+  ]);
+  expect(response?.payload.entries[0]?.gitRuntime).toBeUndefined();
 });
 
 test("fetch_workspaces_response emits before cold registration-triggered git work starts", async () => {

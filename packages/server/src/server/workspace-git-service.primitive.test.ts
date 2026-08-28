@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { createGitHubService } from "../services/github-service.js";
+import { createGitHubService, GITHUB_POLL_ALIGNMENT_MS } from "../services/github-service.js";
 import type { CurrentPullRequestStatus, ForgeService } from "../services/forge-service.js";
 import { defaultForgeRegistry } from "../services/forge-registry.js";
 import {
@@ -23,6 +23,7 @@ import {
 } from "../utils/run-git-command.js";
 import {
   getWorkspaceGitSelfHealPhaseMs,
+  WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS,
   WorkspaceGitServiceImpl,
   type WorkspaceGitRuntimeSnapshot,
 } from "./workspace-git-service.js";
@@ -568,6 +569,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(listener).not.toHaveBeenCalled();
     expect(service.peekSnapshot(REPO_CWD)).toBeNull();
 
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
     await vi.waitFor(() => {
       expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
     });
@@ -917,7 +919,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     service.dispose();
   });
 
-  test("quiet observed workspaces do not refresh git on the observation re-ensure timer", async () => {
+  test("quiet observed workspaces do not refresh git or forge on the observation re-ensure timer", async () => {
     let nowMs = 0;
     const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
     const getPullRequestStatus = vi.fn(async () => createPullRequestStatusResult());
@@ -930,20 +932,16 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, () => {
       initialSnapshotReady.resolve();
     });
+    nowMs = WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS;
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
     await initialSnapshotReady.promise;
 
     nowMs = 120_000;
-    await vi.advanceTimersByTimeAsync(120_000);
+    await vi.advanceTimersByTimeAsync(120_000 - WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
     await flushPromises();
 
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
-    expect(getPullRequestStatus).toHaveBeenCalledTimes(1);
-    expect(getPullRequestStatus).toHaveBeenCalledWith(
-      REPO_CWD,
-      expect.anything(),
-      { force: false, reason: "initial" },
-      expect.anything(),
-    );
+    expect(getPullRequestStatus).not.toHaveBeenCalled();
 
     subscription.unsubscribe();
     service.dispose();
@@ -954,7 +952,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     expect(getWorkspaceGitSelfHealPhaseMs("/tmp/staggered-repo")).toBe(9_817);
   });
 
-  test("observation re-ensure retries setup even when the git snapshot is still recent", async () => {
+  test("observation setup recovers after the delayed initial refresh cannot read facts", async () => {
     let nowMs = 0;
     const getCheckoutSnapshotFacts = vi
       .fn<(cwd: string) => Promise<CheckoutSnapshotFacts>>()
@@ -972,6 +970,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     });
 
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
     await vi.waitFor(() => {
       expect(getCheckoutSnapshotFacts).toHaveBeenCalled();
       expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
@@ -979,12 +978,12 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     });
 
     expect(getCheckoutSnapshotFacts).toHaveBeenCalled();
-    expect(subscribe).not.toHaveBeenCalled();
+    expect(subscribe).toHaveBeenCalledTimes(2);
 
     nowMs = 30_000;
     await service.getSnapshot(REPO_CWD, { force: true, reason: "recovered-git-read" });
     expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
-    expect(subscribe).not.toHaveBeenCalled();
+    expect(subscribe).toHaveBeenCalledTimes(2);
 
     nowMs = 60_000;
     await vi.advanceTimersByTimeAsync(60_000);
@@ -1017,6 +1016,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     await flushPromises();
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
 
     await vi.waitFor(() => {
       expect(watchCallbacks.length).toBeGreaterThan(0);
@@ -1053,6 +1053,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     await flushPromises();
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
 
     await vi.waitFor(() => {
       expect(github.retainCurrentPullRequestStatusPoll).toHaveBeenCalledTimes(1);
@@ -1081,6 +1082,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
         stderr: "",
       })),
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => null,
       now: () => nowMs,
     });
     const getCurrentPullRequestStatus = github.getCurrentPullRequestStatus.bind(github);
@@ -1101,12 +1104,13 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     const listener = vi.fn();
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
     await flushPromises();
-    await vi.advanceTimersByTimeAsync(0);
+    nowMs = WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS;
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
     await flushPromises();
     const gitReadsAfterInitialSnapshot = getCheckoutStatus.mock.calls.length;
 
     nowMs = 20_000;
-    await vi.advanceTimersByTimeAsync(20_000);
+    await vi.advanceTimersByTimeAsync(20_000 - WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
     await flushPromises();
 
     expect(githubReadCalls).toContainEqual({
@@ -1160,6 +1164,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
 
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     await flushPromises();
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
 
     await vi.waitFor(() => {
       expect(retainCurrentPullRequestStatusPoll).toHaveBeenCalledWith(
@@ -1186,6 +1191,8 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       ttlMs: 0,
       runner,
       resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => null,
       now: () => nowMs,
     });
     const getCurrentPullRequestStatus = github.getCurrentPullRequestStatus.bind(github);
@@ -1205,15 +1212,16 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     await flushPromises();
-    await vi.advanceTimersByTimeAsync(0);
+    nowMs = GITHUB_POLL_ALIGNMENT_MS;
+    await vi.advanceTimersByTimeAsync(GITHUB_POLL_ALIGNMENT_MS);
     await vi.waitFor(() => {
-      expect(runner).toHaveBeenCalledTimes(1);
+      expect(runner).toHaveBeenCalledTimes(2);
     });
     await flushPromises();
     const gitReadsAfterInitialSnapshot = getCheckoutStatus.mock.calls.length;
 
     nowMs = 20_000;
-    await vi.advanceTimersByTimeAsync(20_000);
+    await vi.advanceTimersByTimeAsync(20_000 - GITHUB_POLL_ALIGNMENT_MS);
     await flushPromises();
 
     expect(githubReadCalls).not.toContainEqual({
@@ -1222,13 +1230,13 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     });
     expect(getCheckoutStatus).toHaveBeenCalledTimes(gitReadsAfterInitialSnapshot);
 
-    nowMs = 120_000;
-    await vi.advanceTimersByTimeAsync(100_000);
+    nowMs = 125_000;
+    await vi.advanceTimersByTimeAsync(105_000);
     await flushPromises();
 
     expect(githubReadCalls).toContainEqual({
       reason: "self-heal-github",
-      tickMs: 120_000,
+      tickMs: 125_000,
     });
 
     subscription.unsubscribe();
@@ -1337,10 +1345,16 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     try {
       const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
       await flushPromises();
+      await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
+      await flushPromises();
+      await vi.waitFor(() => {
+        expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1);
+      });
+
       await vi.advanceTimersByTimeAsync(20_000);
       await flushPromises();
 
-      expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1);
+      expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(2);
       subscription.unsubscribe();
     } finally {
       service.dispose();
@@ -1486,6 +1500,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     });
     const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
     await flushPromises();
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
 
     await vi.waitFor(() => {
       expect(retainCurrentPullRequestStatusPoll).toHaveBeenCalledTimes(1);

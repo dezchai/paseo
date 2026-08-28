@@ -61,6 +61,7 @@ $PASEO_HOME/
 │   ├── workspace-labels.transaction.json # Recoverable catalog/assignment compound commit
 │   └── icons/                           # Host-local custom project icon images
 ├── runtime/
+│   ├── workspace-sidebar-status.json    # Expiring last-known PR/check summaries for cold restore
 │   └── managed-processes/
 │       └── {recordId}.json              # Helper processes owned by Paseo; reconciled on daemon bootstrap
 ├── plugins/
@@ -70,6 +71,8 @@ $PASEO_HOME/
 ```
 
 The `agents/{sanitized-cwd}/` directory name is derived from the agent's `cwd` by stripping the filesystem root and replacing path separators with `-` (Windows drive letters become a `C-` style prefix). Persistent server stores write atomically by writing a temp file in the target directory and then renaming it into place.
+
+`runtime/workspace-sidebar-status.json` is a versioned, 24-hour stale-while-revalidate cache, not durable Git state. It stores only the exact workspace path, branch and remote identity, forge id, and the PR/check summary rendered by the sidebar. Cold workspace lists may render it before Git warming. A local branch or remote mismatch removes the entry; a retained forge poll replaces or removes it after validation. Writes are coalesced and atomic. Do not add diffs, dirty state, ahead/behind counts, refs, or complete checkout snapshots to this cache.
 
 ---
 

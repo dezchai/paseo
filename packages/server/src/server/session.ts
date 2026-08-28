@@ -4905,6 +4905,18 @@ export class Session {
     const base = await this.describeWorkspaceRecord(workspace, projectRecord);
     const snapshot = this.workspaceGitService.peekSnapshot(workspace.cwd);
     if (!snapshot) {
+      const cached = this.workspaceGitService.peekCachedSidebarStatus?.(workspace.cwd);
+      if (cached) {
+        return {
+          ...base,
+          githubRuntime: {
+            featuresEnabled: true,
+            pullRequest: cached.pullRequest,
+            error: null,
+          },
+          forge: cached.forge,
+        };
+      }
       return base;
     }
 

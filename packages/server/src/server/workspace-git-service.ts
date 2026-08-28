@@ -49,6 +49,7 @@ import {
 import {
   createRunGitCommand,
   runGitCommand,
+  runWithGitCommandPriority,
   type RunGitCommand,
 } from "../utils/run-git-command.js";
 import { branchNameFromRef } from "../utils/worktree-metadata.js";
@@ -73,6 +74,11 @@ import {
   createFileObserver,
 } from "./file-observer/index.js";
 import { checkoutLiteFromGitSnapshot } from "./workspace-registry-model.js";
+import {
+  WorkspaceSidebarStatusCache,
+  type WorkspaceSidebarStatusCacheEntry,
+  type WorkspaceSidebarStatusCacheStore,
+} from "./workspace-sidebar-status-cache.js";
 import { createWatcherLivenessCanary } from "./watcher-liveness-canary.js";
 
 const WORKSPACE_GIT_WATCH_DEBOUNCE_MS = 1_000;
@@ -86,7 +92,9 @@ const DEGRADED_GIT_POLL_INTERVAL_MS = 5_000;
 // Keep whole workspace pipelines below the lower-level Git process pool so daemon control work
 // retains subprocess and event-loop headroom during large workspace reconciliation bursts.
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
+export const WORKSPACE_GIT_BACKGROUND_REFRESH_CONCURRENCY = WORKSPACE_GIT_REFRESH_CONCURRENCY - 1;
 export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
+export const WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS = 5_000;
 export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
 const WATCH_RECOVERY_BASE_DELAY_MS = 30_000;
 const WATCH_RECOVERY_MAX_ATTEMPTS = 3;
@@ -98,6 +106,136 @@ const WORKSPACE_GIT_INTERNAL_MIN_GAP_MS = 2_000;
 const WORKSPACE_GIT_CHECKOUT_DIFF_CACHE_MAX = 64;
 // Small values (booleans, short strings, small arrays); generous cap.
 const WORKSPACE_GIT_AUXILIARY_CACHE_MAX = 256;
+
+type WorkspaceRefreshPriority = "foreground" | "background";
+
+interface WorkspaceRefreshAdmissionTask {
+  key: string;
+  priority: WorkspaceRefreshPriority;
+  operation: () => Promise<unknown> | unknown;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+}
+
+class WorkspaceRefreshAdmissionLimit {
+  private active = 0;
+  private activeBackground = 0;
+  private readonly foreground: WorkspaceRefreshAdmissionTask[] = [];
+  private readonly background: WorkspaceRefreshAdmissionTask[] = [];
+  private readonly pendingByKey = new Map<string, WorkspaceRefreshAdmissionTask>();
+
+  constructor(
+    private readonly concurrency: number,
+    private readonly backgroundConcurrency: number,
+  ) {}
+
+  get activeCount(): number {
+    return this.active;
+  }
+
+  get pendingCount(): number {
+    return this.foreground.length + this.background.length;
+  }
+
+  run<T>(
+    key: string,
+    priority: WorkspaceRefreshPriority,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    return new Promise<T>((settle, reject) => {
+      const task: WorkspaceRefreshAdmissionTask = {
+        key,
+        priority,
+        operation,
+        resolve: (value) => settle(value as T),
+        reject,
+      };
+      if (this.canStart(priority)) {
+        this.start(task);
+        return;
+      }
+      this.pendingByKey.set(key, task);
+      (priority === "foreground" ? this.foreground : this.background).push(task);
+    });
+  }
+
+  promote(key: string): void {
+    const task = this.pendingByKey.get(key);
+    if (!task || task.priority === "foreground") {
+      return;
+    }
+    const index = this.background.indexOf(task);
+    if (index < 0) {
+      return;
+    }
+    this.background.splice(index, 1);
+    task.priority = "foreground";
+    this.foreground.push(task);
+    this.drain();
+  }
+
+  clearQueue(): void {
+    const abortError = new Error("Workspace Git refresh admission was cleared");
+    abortError.name = "AbortError";
+    const pending = [...this.foreground, ...this.background];
+    this.foreground.length = 0;
+    this.background.length = 0;
+    this.pendingByKey.clear();
+    for (const task of pending) {
+      task.reject(abortError);
+    }
+  }
+
+  private start(task: WorkspaceRefreshAdmissionTask): void {
+    this.pendingByKey.delete(task.key);
+    this.active += 1;
+    if (task.priority === "background") {
+      this.activeBackground += 1;
+    }
+    void Promise.resolve()
+      .then(task.operation)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        this.active -= 1;
+        if (task.priority === "background") {
+          this.activeBackground -= 1;
+        }
+        this.drain();
+      });
+  }
+
+  private drain(): void {
+    while (this.active < this.concurrency) {
+      const foregroundTask = this.foreground.shift();
+      if (foregroundTask) {
+        this.start(foregroundTask);
+        continue;
+      }
+      if (this.activeBackground >= this.backgroundConcurrency) {
+        return;
+      }
+      const backgroundTask = this.background.shift();
+      if (!backgroundTask) {
+        return;
+      }
+      this.start(backgroundTask);
+    }
+  }
+
+  private canStart(priority: WorkspaceRefreshPriority): boolean {
+    if (this.active >= this.concurrency) {
+      return false;
+    }
+    return priority === "foreground" || this.activeBackground < this.backgroundConcurrency;
+  }
+}
+
+function mergeWorkspaceRefreshPriority(
+  left: WorkspaceRefreshPriority,
+  right: WorkspaceRefreshPriority,
+): WorkspaceRefreshPriority {
+  return left === "foreground" ? left : right;
+}
 
 function mergeSets<T>(
   left: ReadonlySet<T>,
@@ -181,6 +319,7 @@ export interface WorkspaceGitService {
 
   onSnapshotUpdated(listener: WorkspaceGitSnapshotUpdatedListener): WorkspaceGitSubscription;
   peekSnapshot(cwd: string): WorkspaceGitRuntimeSnapshot | null;
+  peekCachedSidebarStatus?(cwd: string): WorkspaceSidebarStatusCacheEntry | null;
   getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload>;
   getSnapshot(
     cwd: string,
@@ -299,6 +438,7 @@ export type WorkspaceGitSnapshotOptions =
     };
 
 interface WorkspaceGitRefreshRequest {
+  priority: WorkspaceRefreshPriority;
   force: boolean;
   refreshStructure: boolean;
   refreshWorktree: boolean;
@@ -368,6 +508,7 @@ interface WorkspaceGitServiceOptions {
   paseoHome: string;
   worktreesRoot?: string;
   fileObserver?: FileObserver;
+  sidebarStatusCache?: WorkspaceSidebarStatusCacheStore;
   deps?: Partial<WorkspaceGitServiceDependencies>;
 }
 
@@ -391,6 +532,7 @@ interface WorkspaceGitTarget {
   cwd: string;
   listeners: Set<WorkspaceGitListener>;
   workingTreeWatchTarget: WorkingTreeWatchTarget | null;
+  initialRefreshTimer: NodeJS.Timeout | null;
   debounceTimer: NodeJS.Timeout | null;
   pendingDebounceRequest: WorkspaceGitRefreshRequest | null;
   observationReensureTimer: NodeJS.Timeout | null;
@@ -400,6 +542,7 @@ interface WorkspaceGitTarget {
   latestGit: WorkspaceGitRuntimeSnapshot["git"] | null;
   latestGitLoadedAtMs: number | null;
   latestForge: WorkspaceGitRuntimeSnapshot["forge"] | null;
+  cachedSidebarStatus: WorkspaceSidebarStatusCacheEntry | null;
   latestForgeLoadedAtMs: number | null;
   latestSnapshot: WorkspaceGitRuntimeSnapshot | null;
   latestSnapshotLoadedAtMs: number | null;
@@ -524,10 +667,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private readonly fileObserver: FileObserver;
   private readonly deps: WorkspaceGitServiceDependencies;
   private readonly forgeResolver: ForgeResolver;
-  private readonly workspaceRefreshLimit = pLimit({
-    concurrency: WORKSPACE_GIT_REFRESH_CONCURRENCY,
-    rejectOnClear: true,
-  });
+  private readonly sidebarStatusCache: WorkspaceSidebarStatusCacheStore;
+  private readonly workspaceRefreshLimit = new WorkspaceRefreshAdmissionLimit(
+    WORKSPACE_GIT_REFRESH_CONCURRENCY,
+    WORKSPACE_GIT_BACKGROUND_REFRESH_CONCURRENCY,
+  );
   private readonly workspaceObservationSetupLimit = pLimit({
     concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
     rejectOnClear: true,
@@ -575,6 +719,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.logger = options.logger.child({ module: "workspace-git-service" });
     this.paseoHome = options.paseoHome;
     this.worktreesRoot = options.worktreesRoot;
+    this.sidebarStatusCache =
+      options.sidebarStatusCache ??
+      new WorkspaceSidebarStatusCache({ paseoHome: this.paseoHome, logger: options.logger });
     this.fileObserver = options.fileObserver ?? createFileObserver();
     this.deps = resolveWorkspaceGitServiceDeps(
       this.fileObserver.subscribe.bind(this.fileObserver),
@@ -603,8 +750,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
     if (!target.latestSnapshot) {
       this.scheduleInitialWorkspaceRefresh(target);
+    } else {
+      this.scheduleWorkspaceObservationSetup(target);
     }
-    this.scheduleWorkspaceObservationSetup(target);
 
     return {
       unsubscribe: () => {
@@ -691,6 +839,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
 
     return this.requestWorkspaceSnapshot(target, request);
+  }
+
+  peekCachedSidebarStatus(cwd: string): WorkspaceSidebarStatusCacheEntry | null {
+    this.assertNotDisposed();
+    return this.sidebarStatusCache.peek(resolve(cwd));
   }
 
   async getCheckout(cwd: string): Promise<ProjectCheckoutLitePayload> {
@@ -900,6 +1053,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     cwd = resolve(cwd);
     const target = this.ensureWorkspaceTarget(cwd);
     await this.refreshWorkspaceTarget(target, {
+      priority: "foreground",
       force: false,
       refreshStructure: true,
       refreshWorktree: true,
@@ -988,7 +1142,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workingTreeWatchResolutions.clear();
     this.workingTreeWatchAliases.clear();
     this.snapshotUpdatedListeners.clear();
-    this.disposePromise = this.fileObserver.close();
+    this.disposePromise = Promise.all([
+      this.fileObserver.close(),
+      this.sidebarStatusCache.dispose(),
+    ]).then(() => undefined);
     return this.disposePromise;
   }
 
@@ -1133,6 +1290,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       cwd,
       listeners: new Set(),
       workingTreeWatchTarget: null,
+      initialRefreshTimer: null,
       debounceTimer: null,
       pendingDebounceRequest: null,
       observationReensureTimer: null,
@@ -1142,6 +1300,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       latestGit: null,
       latestGitLoadedAtMs: null,
       latestForge: null,
+      cachedSidebarStatus: this.sidebarStatusCache.peek(cwd),
       latestForgeLoadedAtMs: null,
       latestSnapshot: null,
       latestSnapshotLoadedAtMs: null,
@@ -1160,21 +1319,30 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private scheduleInitialWorkspaceRefresh(target: WorkspaceGitTarget): void {
-    queueMicrotask(() => {
+    if (target.initialRefreshTimer) {
+      return;
+    }
+    target.initialRefreshTimer = setTimeout(() => {
+      target.initialRefreshTimer = null;
       if (!this.isActiveObservedWorkspaceTarget(target) || target.latestSnapshot) {
         return;
       }
       void this.refreshWorkspaceTarget(target, {
+        priority: "background",
         force: false,
         refreshStructure: true,
         refreshWorktree: true,
-        includeForge: true,
+        includeForge: false,
         reason: "initial",
         notify: true,
         queueIfBusy: false,
         movedRemoteRefs: new Set(),
+      }).finally(() => {
+        if (this.isActiveObservedWorkspaceTarget(target)) {
+          this.scheduleWorkspaceObservationSetup(target);
+        }
       });
-    });
+    }, WORKSPACE_GIT_INITIAL_BACKGROUND_DELAY_MS);
   }
 
   private scheduleWorkspaceObservationSetup(target: WorkspaceGitTarget): void {
@@ -1512,6 +1680,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
             return;
           }
           await this.refreshWorkspaceTarget(workspaceTarget, {
+            priority: "background",
             force: false,
             refreshStructure: target.repoRoot === null,
             refreshWorktree: true,
@@ -2308,6 +2477,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
             workingTreeTargets.add(workingTreeTarget);
           }
           await this.refreshWorkspaceTarget(workspaceTarget, {
+            priority: "background",
             force: false,
             refreshStructure: true,
             refreshWorktree: true,
@@ -2422,7 +2592,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.forgePrStatusPollKey === pollKey && target.forgePrStatusPollSubscription) {
       return;
     }
-    const pollImmediately = previousPollKey !== null && previousPollKey !== pollKey;
+    const pollImmediately = previousPollKey === null || previousPollKey !== pollKey;
 
     this.stopForgePrStatusPollForTarget(target);
     target.forgePrStatusPollKey = pollKey;
@@ -2638,6 +2808,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): Promise<WorkspaceGitRuntimeSnapshot> {
     if (target.refreshState.status === "in-flight") {
       const active = target.refreshState.request;
+      if (request.priority === "foreground") {
+        active.priority = "foreground";
+        this.workspaceRefreshLimit.promote(target.cwd);
+      }
       const addsWork =
         (request.force && !active.force) ||
         (request.refreshStructure && !active.refreshStructure) ||
@@ -2682,6 +2856,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     const force = options?.force === true;
     return {
+      priority: "foreground",
       force,
       refreshStructure: true,
       refreshWorktree: true,
@@ -2710,6 +2885,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): WorkspaceGitRefreshRequest {
     const scope = options?.scope;
     return {
+      priority: "background",
       force: options?.force === true,
       refreshStructure: scope !== "worktree" && scope !== "refs",
       refreshWorktree: scope !== "structure" && scope !== "refs",
@@ -2741,6 +2917,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       request.movedRemoteRefs,
     );
     return {
+      priority: mergeWorkspaceRefreshPriority(pending.priority, request.priority),
       force,
       refreshStructure: pending.refreshStructure || request.refreshStructure,
       refreshWorktree: pending.refreshWorktree || request.refreshWorktree,
@@ -2781,13 +2958,21 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         });
       }
       try {
-        const runRefreshGitCommand = createRunGitCommand(`workspace-refresh:${request.reason}`);
-        const admittedSnapshot = await this.workspaceRefreshLimit(() => {
-          if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
-            return null;
-          }
-          return this.refreshSnapshot(target, request, runRefreshGitCommand);
-        });
+        const runRefreshGitCommandBase = createRunGitCommand(`workspace-refresh:${request.reason}`);
+        const runRefreshGitCommand: RunGitCommand = (args, options) =>
+          runWithGitCommandPriority(request.priority === "foreground" ? "high" : "normal", () =>
+            runRefreshGitCommandBase(args, options),
+          );
+        const admittedSnapshot = await this.workspaceRefreshLimit.run(
+          target.cwd,
+          request.priority,
+          () => {
+            if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+              return null;
+            }
+            return this.refreshSnapshot(target, request, runRefreshGitCommand);
+          },
+        );
         if (!admittedSnapshot) {
           break;
         }
@@ -2997,7 +3182,8 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target.latestGitLoadedAtMs = loadedAtMs;
 
     if (previousForgePrStatusPollKey !== this.getForgePrStatusPollKey(target)) {
-      target.latestForge = buildForgeUnavailableSnapshot();
+      target.latestForge =
+        this.restoreCachedForgeSnapshot(target) ?? buildForgeUnavailableSnapshot();
       target.latestForgeLoadedAtMs = target.latestGitLoadedAtMs;
     }
     return facts;
@@ -3088,9 +3274,55 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
 
     target.latestForge = github;
     target.latestForgeLoadedAtMs = this.deps.now().getTime();
+    this.rememberSidebarStatus(target, github);
     this.rememberSnapshot(target, this.combineSnapshot(target), {
       notify: options?.notify,
       forceEmit: false,
+    });
+  }
+
+  private restoreCachedForgeSnapshot(
+    target: WorkspaceGitTarget,
+  ): WorkspaceGitRuntimeSnapshot["forge"] | null {
+    const cached = target.cachedSidebarStatus;
+    target.cachedSidebarStatus = null;
+    if (!cached) {
+      return null;
+    }
+    const git = target.latestGit;
+    if (
+      !git?.isGit ||
+      git.currentBranch !== cached.currentBranch ||
+      git.remoteUrl !== cached.remoteUrl
+    ) {
+      this.sidebarStatusCache.forget(target.cwd);
+      return null;
+    }
+    return {
+      ...buildForgeSnapshot("authenticated", cached.pullRequest, null),
+      forge: cached.forge,
+    };
+  }
+
+  private rememberSidebarStatus(
+    target: WorkspaceGitTarget,
+    forge: WorkspaceGitRuntimeSnapshot["forge"],
+  ): void {
+    const git = target.latestGit;
+    if (!git?.isGit || !git.currentBranch || !git.remoteUrl) {
+      this.sidebarStatusCache.forget(target.cwd);
+      return;
+    }
+    if (!forge.forge || !forge.pullRequest) {
+      this.sidebarStatusCache.forget(target.cwd);
+      return;
+    }
+    this.sidebarStatusCache.remember({
+      cwd: target.cwd,
+      currentBranch: git.currentBranch,
+      remoteUrl: git.remoteUrl,
+      forge: forge.forge,
+      pullRequest: toCachedSidebarPullRequest(forge.pullRequest),
     });
   }
 
@@ -3312,6 +3544,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       clearTimeout(target.debounceTimer);
       target.debounceTimer = null;
     }
+    if (target.initialRefreshTimer) {
+      clearTimeout(target.initialRefreshTimer);
+      target.initialRefreshTimer = null;
+    }
     if (target.observationReensureTimer) {
       clearTimeout(target.observationReensureTimer);
       target.observationReensureTimer = null;
@@ -3526,6 +3762,28 @@ function buildForgeSnapshotFromStatus(
   forge: string,
 ): WorkspaceGitRuntimeSnapshot["forge"] {
   return { ...buildForgeSnapshot("authenticated", status, null), forge };
+}
+
+function toCachedSidebarPullRequest(
+  pullRequest: NonNullable<WorkspaceGitRuntimeSnapshot["forge"]["pullRequest"]>,
+): WorkspaceSidebarStatusCacheEntry["pullRequest"] {
+  return {
+    ...(pullRequest.number !== undefined ? { number: pullRequest.number } : {}),
+    ...(pullRequest.repoOwner ? { repoOwner: pullRequest.repoOwner } : {}),
+    ...(pullRequest.repoName ? { repoName: pullRequest.repoName } : {}),
+    ...(pullRequest.projectPath ? { projectPath: pullRequest.projectPath } : {}),
+    url: pullRequest.url,
+    title: pullRequest.title,
+    state: pullRequest.state,
+    baseRefName: pullRequest.baseRefName,
+    headRefName: pullRequest.headRefName,
+    isMerged: pullRequest.isMerged,
+    ...(pullRequest.isDraft !== undefined ? { isDraft: pullRequest.isDraft } : {}),
+    ...(pullRequest.checksStatus ? { checksStatus: pullRequest.checksStatus } : {}),
+    ...(pullRequest.reviewDecision !== undefined
+      ? { reviewDecision: pullRequest.reviewDecision }
+      : {}),
+  };
 }
 
 function buildWorkspaceForgePrStatusPollKey({
