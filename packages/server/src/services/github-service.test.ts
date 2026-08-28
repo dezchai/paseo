@@ -297,6 +297,20 @@ function batchPollStatusJson(aliases: Record<string, unknown>): string {
   return JSON.stringify({ data: aliases });
 }
 
+function batchPollStatusWithRateLimitJson(input: {
+  aliases: Record<string, unknown>;
+  limit: number;
+  remaining: number;
+  resetAt: string;
+}): string {
+  return JSON.stringify({
+    data: {
+      ...input.aliases,
+      rateLimit: { limit: input.limit, remaining: input.remaining, resetAt: input.resetAt },
+    },
+  });
+}
+
 function createCurrentPullRequestStatus(
   overrides: Partial<CurrentPullRequestStatus> = {},
 ): CurrentPullRequestStatus {
@@ -1261,6 +1275,234 @@ describe("ForgeService", () => {
     expect(runner.calls[0]?.args.slice(0, 2)).toEqual(["api", "graphql"]);
     expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(1);
     expect(statuses).toEqual([expect.objectContaining({ number: 42, state: "open" })]);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("redirects a fork poll to its parent and reuses that batch address", async () => {
+    let now = 0;
+    const parent = { owner: { login: "upstream" }, name: "widgets" };
+    const forkPr = batchPollPrNodeJson({
+      url: "https://github.com/upstream/widgets/pull/42",
+      headRefName: "feat-a",
+      headRefOid: "oid-a",
+      headRepositoryOwner: { login: "forkowner" },
+    });
+    const runner = createScriptedRunner([
+      batchPollStatusJson({
+        t0: batchPollRepositoryJson([], { isFork: true, parent }),
+      }),
+      batchPollStatusJson({ t0: batchPollRepositoryJson([forkPr]) }),
+      batchPollStatusJson({
+        t0: batchPollChecksAliasJson([
+          { __typename: "StatusContext", context: "ci", state: "SUCCESS" },
+        ]),
+      }),
+      batchPollStatusJson({ t0: batchPollRepositoryJson([forkPr]) }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "forkowner/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      headSha: "oid-a",
+      onStatus: (status) => statuses.push(status),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(currentPullRequestStatusCalls(runner.calls)).toHaveLength(0);
+    expect(runner.calls[0]?.args[3]).toContain(
+      't0: repository(owner: "forkowner", name: "widgets")',
+    );
+    expect(runner.calls[1]?.args[3]).toContain(
+      't0: repository(owner: "upstream", name: "widgets")',
+    );
+    expect(statuses).toEqual([
+      expect.objectContaining({ number: 42, repoOwner: "upstream", checksStatus: "success" }),
+    ]);
+
+    now = EXPECTED_GITHUB_SLOW_POLL_MS;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_SLOW_POLL_MS);
+    await flushMicrotasks();
+
+    expect(runner.calls[3]?.args[3]).toContain(
+      't0: repository(owner: "upstream", name: "widgets")',
+    );
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("treats a missing pullRequests connection as a failed alias", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([
+      batchPollStatusJson({
+        t0: { isFork: false, autoMergeAllowed: true },
+      }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+    const errors: unknown[] = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onStatus: (status) => statuses.push(status),
+      onError: (error) => errors.push(error),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(statuses).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(GitHubCommandError);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("treats a malformed checks connection as a failed alias", async () => {
+    let now = 0;
+    const runner = createScriptedRunner([
+      batchPollStatusJson({
+        t0: batchPollRepositoryJson([batchPollPrNodeJson({ state: "OPEN", mergedAt: null })]),
+      }),
+      batchPollStatusJson({ t0: { pullRequest: {} } }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const statuses: Array<CurrentPullRequestStatus | null> = [];
+    const errors: unknown[] = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onStatus: (status) => statuses.push(status),
+      onError: (error) => errors.push(error),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(statuses).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBeInstanceOf(GitHubCommandError);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("pauses a host until reset when a batch reaches the GraphQL reserve", async () => {
+    let now = 0;
+    const resetAt = new Date(EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS).toISOString();
+    const runner = createScriptedRunner([
+      batchPollStatusWithRateLimitJson({
+        aliases: { t0: batchPollRepositoryJson([batchPollPrNodeJson()]) },
+        limit: 5_000,
+        remaining: 2_000,
+        resetAt,
+      }),
+      batchPollStatusJson({ t0: batchPollRepositoryJson([]) }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+    const errors: unknown[] = [];
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+      onError: (error) => errors.push(error),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls).toHaveLength(1);
+    expect(runner.calls[0]?.args[3]).toContain("rateLimit");
+    expect(errors).toHaveLength(1);
+
+    now = EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS);
+    await flushMicrotasks();
+    expect(runner.calls).toHaveLength(1);
+
+    now += 1_000;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushMicrotasks();
+    expect(runner.calls).toHaveLength(2);
+
+    subscription?.unsubscribe();
+    service.dispose?.();
+  });
+
+  it("loads the reset time once when GitHub rejects a batch for rate limiting", async () => {
+    let now = 0;
+    const rateLimitError = Object.assign(new Error("gh exited 1"), {
+      code: 1,
+      stderr: "GraphQL: API rate limit already exceeded for user ID 123",
+    });
+    const runner = createScriptedRunner([
+      { error: rateLimitError },
+      JSON.stringify({ resources: { graphql: { remaining: 0, reset: 300 } } }),
+      batchPollStatusJson({ t0: batchPollRepositoryJson([]) }),
+    ]);
+    const service = createGitHubService({
+      ttlMs: 0,
+      runner: runner.runner,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveRepoHost: async () => null,
+      resolveRepoSlug: async () => "acme/widgets",
+      now: () => now,
+    });
+
+    const subscription = service.retainCurrentPullRequestStatusPoll?.({
+      cwd: "/ws-a",
+      headRef: "feat-a",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await flushMicrotasks();
+
+    expect(runner.calls.map((call) => call.args.slice(0, 2))).toEqual([
+      ["api", "graphql"],
+      ["api", "rate_limit"],
+    ]);
+
+    now = EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS;
+    await vi.advanceTimersByTimeAsync(EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS);
+    await flushMicrotasks();
+    expect(runner.calls).toHaveLength(2);
+
+    now += 1_000;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flushMicrotasks();
+    expect(runner.calls).toHaveLength(3);
 
     subscription?.unsubscribe();
     service.dispose?.();
