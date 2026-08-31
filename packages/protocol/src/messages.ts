@@ -3746,6 +3746,7 @@ export const WorkspaceGitHubRuntimePayloadSchema = z
         repoOwner: z.string().optional(),
         repoName: z.string().optional(),
         github: z.unknown().optional(),
+        forgeSpecific: z.unknown().optional(),
       })
       .nullable()
       .optional(),

@@ -968,6 +968,7 @@ export const ru: TranslationResources = {
         },
         states: {
           draft: "Черновик",
+          queued: "В очереди на слияние",
           merged: "Объединён",
           closed: "Закрыт",
           open: "Открыт",
