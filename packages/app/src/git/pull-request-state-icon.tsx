@@ -1,10 +1,10 @@
-import { GitGraph, GitMerge, GitPullRequest, GitPullRequestClosed } from "lucide-react-native";
+import { GitMerge, GitPullRequest, GitPullRequestClosed, ListEnd } from "lucide-react-native";
 import { withUnistyles } from "react-native-unistyles";
 import type { Theme } from "@/styles/theme";
 import type { PrHint } from "@/git/pr-hint";
 
 const ThemedGitPullRequest = withUnistyles(GitPullRequest);
-const ThemedGitGraph = withUnistyles(GitGraph);
+const ThemedListEnd = withUnistyles(ListEnd);
 const ThemedGitMerge = withUnistyles(GitMerge);
 const ThemedGitPullRequestClosed = withUnistyles(GitPullRequestClosed);
 
@@ -15,7 +15,7 @@ const dangerMapping = (theme: Theme) => ({ color: theme.colors.statusDanger });
 
 const PRESENTATION = {
   open: { Icon: ThemedGitPullRequest, color: successMapping },
-  queued: { Icon: ThemedGitGraph, color: queuedMapping },
+  queued: { Icon: ThemedListEnd, color: queuedMapping },
   merged: { Icon: ThemedGitMerge, color: mergedMapping },
   closed: { Icon: ThemedGitPullRequestClosed, color: dangerMapping },
 } as const;
